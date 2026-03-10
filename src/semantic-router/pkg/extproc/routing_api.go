@@ -5,8 +5,12 @@ package extproc
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/tracing"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/entropy"
 )
 
@@ -17,6 +21,17 @@ type RoutingResult struct {
 	ReasoningDecision entropy.ReasoningDecision
 	SelectedModel     string
 }
+
+// RouteError is a typed error that carries an HTTP status code for proper error responses.
+type RouteError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *RouteError) Error() string      { return e.Message }
+func (e *RouteError) HTTPStatus() int     { return e.StatusCode }
+func (e *RouteError) ErrorCode() string   { return e.Code }
 
 // PerformRoutingDecision evaluates signals and decisions for an HTTP routing request.
 // It wraps the internal performDecisionEvaluation method with a clean public API.
@@ -52,18 +67,33 @@ func emptyIfNil(s []string) []string {
 func HandleRouteRequest(router *OpenAIRouter, body []byte, headers map[string]string) (map[string]interface{}, error) {
 	start := time.Now()
 
+	metrics.RecordRoutingAPIRequest()
+
 	fast, err := extractContentFast(body)
 	if err != nil {
-		return nil, err
+		metrics.RecordRoutingAPIError("extract_error")
+		return nil, &RouteError{
+			StatusCode: http.StatusBadRequest,
+			Code:       "EXTRACT_ERROR",
+			Message:    fmt.Sprintf("failed to extract request fields: %v", err),
+		}
 	}
 	if fast.Model == "" {
-		return nil, fmt.Errorf("model field is required")
+		metrics.RecordRoutingAPIError("missing_model")
+		return nil, &RouteError{
+			StatusCode: http.StatusBadRequest,
+			Code:       "MISSING_FIELD",
+			Message:    "model field is required",
+		}
 	}
+
+	// Propagate trace context from headers (if present)
+	traceCtx := tracing.ExtractTraceContext(context.Background(), headers)
 
 	reqCtx := &RequestContext{
 		Headers:         headers,
 		StartTime:       start,
-		TraceContext:     context.Background(),
+		TraceContext:     traceCtx,
 		RequestModel:    fast.Model,
 		UserContent:     fast.UserContent,
 		RequestImageURL: fast.FirstImageURL,
@@ -74,10 +104,23 @@ func HandleRouteRequest(router *OpenAIRouter, body []byte, headers map[string]st
 
 	result, err := router.PerformRoutingDecision(fast.Model, fast.UserContent, fast.NonUserMessages, reqCtx)
 	if err != nil {
-		return nil, err
+		metrics.RecordRoutingAPIError("decision_error")
+		// Authz errors from performDecisionEvaluation are 403
+		return nil, &RouteError{
+			StatusCode: http.StatusForbidden,
+			Code:       "AUTHZ_DENIED",
+			Message:    err.Error(),
+		}
 	}
 
-	return BuildRouteResponse(result, reqCtx, time.Since(start).Milliseconds()), nil
+	latencyMs := time.Since(start).Milliseconds()
+	metrics.RecordRoutingAPILatency(float64(latencyMs) / 1000.0)
+
+	logging.Infof("[RoutingAPI] request_id=%s model=%s decision=%s confidence=%.3f selected=%s method=%s latency=%dms",
+		reqCtx.RequestID, fast.Model, result.DecisionName, result.Confidence,
+		result.SelectedModel, reqCtx.VSRSelectionMethod, latencyMs)
+
+	return BuildRouteResponse(result, reqCtx, latencyMs), nil
 }
 
 // BuildRouteResponse builds the full routing API JSON response from a RoutingResult
@@ -87,13 +130,13 @@ func HandleRouteRequest(router *OpenAIRouter, body []byte, headers map[string]st
 func BuildRouteResponse(result *RoutingResult, ctx *RequestContext, processingTimeMs int64) map[string]interface{} {
 	return map[string]interface{}{
 		"routing_decision": map[string]interface{}{
-			"selected_model":        result.SelectedModel,
-			"decision_name":         result.DecisionName,
-			"decision_confidence":   result.Confidence,
-			"selected_category":     ctx.VSRSelectedCategory,
-			"reasoning_mode":        ctx.VSRReasoningMode,
-			"selected_modality":     ctx.VSRMatchedModality,
-			"selection_method":      ctx.VSRSelectionMethod,
+			"selected_model":         result.SelectedModel,
+			"decision_name":          result.DecisionName,
+			"decision_confidence":    result.Confidence,
+			"selected_category":      ctx.VSRSelectedCategory,
+			"reasoning_mode":         ctx.VSRReasoningMode,
+			"selected_modality":      ctx.VSRMatchedModality,
+			"selection_method":       ctx.VSRSelectionMethod,
 			"injected_system_prompt": ctx.VSRInjectedSystemPrompt,
 		},
 		"matched_signals": map[string]interface{}{
@@ -117,7 +160,7 @@ func BuildRouteResponse(result *RoutingResult, ctx *RequestContext, processingTi
 			"pii_detected":       ctx.PIIDetected,
 			"pii_entities":       emptyIfNil(ctx.PIIEntities),
 		},
-		"request_id":        ctx.RequestID,
+		"request_id":         ctx.RequestID,
 		"processing_time_ms": processingTimeMs,
 	}
 }

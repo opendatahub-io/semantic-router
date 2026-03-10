@@ -3,14 +3,23 @@
 package apiserver
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
+
+// httpError is an interface for errors that carry HTTP status information.
+// This avoids importing extproc (which would create a circular import).
+type httpError interface {
+	error
+	HTTPStatus() int
+	ErrorCode() string
+}
 
 // RouteHandler is a function that takes a raw request body, optional headers,
 // and returns the routing decision as a JSON-serializable map.
@@ -41,6 +50,9 @@ func (s *ClassificationAPIServer) handleRoute(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Limit request body size to prevent resource exhaustion
+	limitBody(r)
+
 	// Read raw body — passed as-is to the route handler for fast extraction
 	defer func() { _ = r.Body.Close() }()
 	body, err := io.ReadAll(r.Body)
@@ -49,38 +61,36 @@ func (s *ClassificationAPIServer) handleRoute(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Extract only metadata.headers (our HTTP API extension, not part of OpenAI format).
+	// Extract only metadata.headers using gjson (our HTTP API extension, not part of OpenAI format).
 	// All other parsing (model, messages, content) is done by extractContentFast in the handler.
 	headers := extractMetadataHeaders(body)
 
 	// Delegate to the route handler (set from main.go, lives in extproc)
 	resp, err := globalRouteHandler(body, headers)
 	if err != nil {
-		logging.Errorf("[RoutingAPI] Decision evaluation failed: %v", err)
-		s.writeErrorResponse(w, http.StatusForbidden, "AUTHZ_DENIED", err.Error())
+		logging.Errorf("[RoutingAPI] Request failed: %v", err)
+		if re, ok := err.(httpError); ok {
+			s.writeErrorResponse(w, re.HTTPStatus(), re.ErrorCode(), re.Error())
+		} else {
+			s.writeErrorResponse(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		}
 		return
 	}
 
 	s.writeJSONResponse(w, http.StatusOK, resp)
 }
 
-// extractMetadataHeaders extracts the optional metadata.headers from the request body.
-// Returns an empty map if metadata is not present or parsing fails.
+// extractMetadataHeaders extracts the optional metadata.headers from the request body
+// using gjson for efficient partial parsing without unmarshaling the full body.
 func extractMetadataHeaders(body []byte) map[string]string {
 	headers := make(map[string]string)
-
-	var meta struct {
-		Metadata *struct {
-			Headers map[string]string `json:"headers,omitempty"`
-		} `json:"metadata,omitempty"`
-	}
-	if err := json.Unmarshal(body, &meta); err != nil {
+	result := gjson.GetBytes(body, "metadata.headers")
+	if !result.Exists() {
 		return headers
 	}
-	if meta.Metadata != nil {
-		for k, v := range meta.Metadata.Headers {
-			headers[strings.ToLower(k)] = v
-		}
-	}
+	result.ForEach(func(key, value gjson.Result) bool {
+		headers[strings.ToLower(key.String())] = value.String()
+		return true
+	})
 	return headers
 }
