@@ -474,6 +474,16 @@ func main() {
 		}
 	}
 
+	// Make the router available to the API server for the /v1/route endpoint.
+	// Uses a closure to avoid circular imports between apiserver and extproc.
+	apiserver.SetRouteHandler(func(body []byte, headers map[string]string) (map[string]interface{}, error) {
+		router := server.GetRouter()
+		if router == nil {
+			return nil, fmt.Errorf("router not initialized")
+		}
+		return extproc.HandleRouteRequest(router, body, headers)
+	})
+
 	// Start API server if enabled
 	if *enableAPI {
 		go func() {
