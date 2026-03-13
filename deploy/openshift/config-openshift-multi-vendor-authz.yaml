@@ -1,0 +1,121 @@
+# Multi-Vendor Authz Routing — Modelless Deployment
+#
+# Routes by WHO the user is (group membership), not what they ask.
+# No ML models required — pure RBAC routing with API translation.
+#
+# Routing:
+#   team-a users → openai-model   (OpenAI format, no translation)
+#   team-b users → anthropic-model (Anthropic format, body+header translation)
+#   unknown      → openai-model   (default fallback)
+#
+# Identity headers (injected by auth backend or passed via metadata.headers):
+#   x-authz-user-id     → user identifier
+#   x-authz-user-groups → comma-separated group list
+
+# --------------------------------------------------------------------------
+# Auto-routing trigger
+# --------------------------------------------------------------------------
+auto_model_name: "auto"
+
+# --------------------------------------------------------------------------
+# Authz — identity headers (Authorino/MaaS convention)
+# --------------------------------------------------------------------------
+authz:
+  fail_open: true
+  identity:
+    user_id_header: "x-authz-user-id"
+    user_groups_header: "x-authz-user-groups"
+
+# --------------------------------------------------------------------------
+# Endpoints
+# --------------------------------------------------------------------------
+vllm_endpoints:
+  - name: "openai-endpoint"
+    address: "DYNAMIC_MODEL_A_IP"
+    port: 8000
+    weight: 1
+  - name: "anthropic-endpoint"
+    address: "DYNAMIC_MODEL_B_IP"
+    port: 8001
+    weight: 1
+
+# --------------------------------------------------------------------------
+# Model Config — openai-model (default) and anthropic-model (translated)
+# --------------------------------------------------------------------------
+model_config:
+  "openai-model":
+    preferred_endpoints: ["openai-endpoint"]
+  "anthropic-model":
+    api_format: "anthropic"
+    preferred_endpoints: ["anthropic-endpoint"]
+
+default_model: "openai-model"
+
+# --------------------------------------------------------------------------
+# Role Bindings — group → role mapping
+# --------------------------------------------------------------------------
+role_bindings:
+  - name: "team-a-binding"
+    description: "Members of team-a route to OpenAI model"
+    subjects:
+      - kind: Group
+        name: "team-a"
+    role: "team_a_role"
+
+  - name: "team-b-binding"
+    description: "Members of team-b route to Anthropic model"
+    subjects:
+      - kind: Group
+        name: "team-b"
+    role: "team_b_role"
+
+# --------------------------------------------------------------------------
+# Decisions — pure authz routing, no semantic signals
+# --------------------------------------------------------------------------
+strategy: "priority"
+
+decisions:
+  - name: "team_a_to_openai"
+    description: "team-a routes to OpenAI model"
+    priority: 200
+    rules:
+      operator: "AND"
+      conditions:
+        - type: "authz"
+          name: "team_a_role"
+    modelRefs:
+      - model: "openai-model"
+        use_reasoning: false
+
+  - name: "team_b_to_anthropic"
+    description: "team-b routes to Anthropic model"
+    priority: 200
+    rules:
+      operator: "AND"
+      conditions:
+        - type: "authz"
+          name: "team_b_role"
+    modelRefs:
+      - model: "anthropic-model"
+        use_reasoning: false
+
+  - name: "default_to_openai"
+    description: "Default fallback for unmatched users"
+    priority: 1
+    rules:
+      operator: "OR"
+      conditions: []
+    modelRefs:
+      - model: "openai-model"
+        use_reasoning: false
+
+# --------------------------------------------------------------------------
+# Disabled features — modelless deployment
+# --------------------------------------------------------------------------
+semantic_cache:
+  enabled: false
+
+tools:
+  enabled: false
+
+clear_route_cache: true
