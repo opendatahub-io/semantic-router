@@ -8,7 +8,7 @@
 # This file serves as an index to those OWNER files.
 #
 # Root owners (fallback reviewers for any unmatched path):
-#   ./OWNER                        — @rootfs, @Xunzhuo
+#   ./OWNER                        — @rootfs, @Xunzhuo, @noyitz, @yossiovadia, @nirrozenbaum
 #
 # Per-directory OWNER files:
 #   ./bench/OWNER                  — Benchmarks & performance
@@ -31,4 +31,4 @@
 # GitHub Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default — root-level owners as fallback
-*  @rootfs @Xunzhuo
+*  @rootfs @Xunzhuo @noyitz @yossiovadia @nirrozenbaum
