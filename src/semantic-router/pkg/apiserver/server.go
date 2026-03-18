@@ -159,6 +159,7 @@ func (s *ClassificationAPIServer) setupRoutes() *http.ServeMux {
 	s.registerMemoryRoutes(mux)
 	registerVectorStoreRoutes(mux, s)
 	registerFileRoutes(mux, s)
+	registerRoutingRoutes(mux, s)
 	return mux
 }
 
